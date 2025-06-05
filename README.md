@@ -1,4 +1,4 @@
-python3 depthconverter.py '/home/null/Desktop/p.jpg' \
+python3 depthconverter.py '/home/null/Desktop/path.jpg' \
     --depth_method stepped_xy_s_coords \
     --s_bounds 2.0 \
     --num_steps 5 \
