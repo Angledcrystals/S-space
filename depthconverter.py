@@ -1,552 +1,662 @@
 import numpy as np
-import matplotlib.pyplot as plt
-from PIL import Image
 import cv2
-from scipy.ndimage import gaussian_filter
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from matplotlib import cm
 import argparse
+from PIL import Image
 import os
+from scipy.ndimage import gaussian_filter
 
-def spherical_to_cartesian(theta, phi, r=1):
-    """Convert spherical coordinates to 3D cartesian."""
-    x = r * np.sin(phi) * np.cos(theta)
-    y = r * np.sin(phi) * np.sin(theta)
-    z = r * np.cos(phi)
+# --- Mathematical Utility Functions ---
+
+def spherical_to_cartesian(theta_deg, phi_deg, r=1):
+    """
+    Converts spherical coordinates (longitude, latitude) to 3D Cartesian coordinates.
+    theta_deg: longitude in degrees (0 to 360)
+    phi_deg: latitude in degrees (-90 to 90)
+    r: radius (default 1 for unit sphere)
+    """
+    theta_rad = np.deg2rad(theta_deg)
+    phi_rad = np.deg2rad(phi_deg)
+    x = r * np.cos(phi_rad) * np.cos(theta_rad)
+    y = r * np.cos(phi_rad) * np.sin(theta_rad)
+    z = r * np.sin(phi_rad)
     return np.array([x, y, z])
 
-def householder_reflection_3d(G, v):
-    """Calculate the Householder reflection of 3D vector G across the hyperplane with normal v."""
-    v_norm = np.linalg.norm(v)
-    if v_norm < 1e-10:
-        return G
-    v_unit = v / v_norm
-    v_dot_G = np.dot(v_unit, G)
-    return G - 2 * v_dot_G * v_unit
-
-def project_3d_to_2d(G_3d, projection_type='stereographic'):
-    """Project 3D vector to 2D using different projection methods."""
-    if projection_type == 'stereographic':
-        if G_3d[2] >= 1.0 - 1e-10:  # Near north pole
-            return np.array([0, 0])
-        denom = 1 - G_3d[2]
-        return np.array([G_3d[0]/denom, G_3d[1]/denom])
-    elif projection_type == 'orthographic':
-        return np.array([G_3d[0], G_3d[1]])
-    elif projection_type == 'cylindrical':
-        theta = np.arctan2(G_3d[1], G_3d[0])
-        z = G_3d[2]
-        return np.array([theta, z])
-
-def stereographic_inverse(S_2d):
-    """Recover 3D point from 2D stereographic projection."""
-    if np.linalg.norm(S_2d) < 1e-10:
-        return np.array([0, 0, 1])
-    
-    norm_sq = np.dot(S_2d, S_2d)
-    denom = 1 + norm_sq
-    
-    x = 2 * S_2d[0] / denom
-    y = 2 * S_2d[1] / denom
-    z = (norm_sq - 1) / denom
-    
-    return np.array([x, y, z])
-
-def calculate_s_depth_mediated(S_2d, depth_method, nuit_radius, lum=0.5, sat=0.5, lum_depth_influence=0.0, sat_depth_influence=0.0):
+def stereographic_projection(x_3d, y_3d, z_3d):
     """
-    Calculate depth value from S-coordinates using various methods, with optional mediation by luminosity and saturation.
-    
-    Args:
-        S_2d: 2D S-coordinate array [S_x, S_y]
-        depth_method: Method for calculating depth
-        nuit_radius: Radius of the Nuit boundary circle
-        lum: Pixel luminosity (0-1)
-        sat: Pixel saturation (0-1)
-        lum_depth_influence: Weight for luminosity's influence on depth
-        sat_depth_influence: Weight for saturation's influence on depth
-    
-    Returns:
-        depth: Depth value (0-1 range)
+    Performs stereographic projection from the North Pole (0,0,1) to the z=0 plane.
+    S_x = x / (1 - z)
+    S_y = y / (1 - z)
     """
-    S_x, S_y = S_2d
-    
-    s_depth = 0.0 # Initialize
-    
-    if depth_method == 'nuit_distance':
-        # Depth based on distance from Nuit boundary
-        distance_from_origin = np.linalg.norm(S_2d)
-        distance_from_nuit = abs(distance_from_origin - nuit_radius)
-        # Closer to boundary = higher depth
-        s_depth = 1.0 / (1.0 + distance_from_nuit * 5.0)
-        
-    elif depth_method == 'stereographic_z':
-        # Use Z-coordinate from stereographic inverse projection
-        S_3d = stereographic_inverse(S_2d)
-        # Map Z from [-1, 1] to [0, 1]
-        s_depth = (S_3d[2] + 1.0) / 2.0
-        
-    elif depth_method == 'radial_distance':
-        # Simple radial distance from origin
-        distance = np.linalg.norm(S_2d)
-        s_depth = 1.0 / (1.0 + distance)
-        
-    elif depth_method == 'golden_spiral':
-        # Depth based on golden spiral pattern
-        phi = (1 + np.sqrt(5)) / 2  # Golden ratio
-        angle = np.arctan2(S_y, S_x)
-        radius = np.linalg.norm(S_2d)
-        
-        # Calculate spiral depth
-        spiral_factor = np.sin(angle * phi + radius * phi)
-        s_depth = 0.5 + 0.5 * spiral_factor
-        
-    elif depth_method == 'intensity_weighted':
-        # Depth based on coordinate magnitude with intensity weighting
-        coord_magnitude = np.sqrt(S_x**2 + S_y**2)
-        s_depth = np.tanh(coord_magnitude)
-        
-    else:
-        # Default: simple coordinate-based depth
-        s_depth = 0.5 + 0.25 * (S_x + S_y)
-    
-    # --- Mediation based on Luminosity and Saturation ---
-    if lum_depth_influence > 0 or sat_depth_influence > 0:
-        # Example mediation: Brighter/more saturated pixels get slightly higher depth
-        # This pushes them 'forward'
-        mediation_factor = 1.0 + (lum * lum_depth_influence + sat * sat_depth_influence)
-        s_depth *= mediation_factor
-        
-    # Ensure depth is in [0, 1] range
-    return np.clip(s_depth, 0.0, 1.0)
-
-def pixel_to_s_coordinate_mediated(px, py, width, height, s_bounds, lum=0.5, sat=0.5, lum_map_weight=0.0, sat_map_weight=0.0):
-    """
-    Convert pixel coordinates to S-coordinate space, mediated by luminosity and saturation.
-    
-    Args:
-        px, py: Pixel coordinates
-        width, height: Image dimensions
-        s_bounds: Bounds of S-coordinate space (tuple or single float)
-        lum: Pixel luminosity (0-1)
-        sat: Pixel saturation (0-1)
-        lum_map_weight: Weight for luminosity's influence on S-coordinate mapping
-        sat_map_weight: Weight for saturation's influence on S-coordinate mapping
-        
-    Returns:
-        S_2d: 2D S-coordinate array [S_x, S_y]
-    """
-    if isinstance(s_bounds, tuple):
-        s_min, s_max = s_bounds
-    else:
-        s_min, s_max = -s_bounds, s_bounds
-    
-    # Normalize pixel coordinates to [0, 1]
-    norm_x = px / (width - 1)
-    norm_y = py / (height - 1)
-    
-    # --- Mediation of S-coordinate mapping ---
-    effective_s_min = s_min
-    effective_s_max = s_max
-    
-    if lum_map_weight > 0 or sat_map_weight > 0:
-        # Example Mediation: Higher lum/sat can expand the effective S-range for that pixel
-        # This makes the S-coordinates for those pixels change more rapidly, potentially
-        # leading to sharper gradients in depth for bright/saturated areas.
-        mediation_factor = 1.0 + (lum * lum_map_weight + sat * sat_map_weight)
-        
-        # Ensure factor is reasonable
-        mediation_factor = np.clip(mediation_factor, 0.8, 1.5) 
-        
-        center = (s_min + s_max) / 2.0
-        current_range = (s_max - s_min)
-        
-        new_range = current_range * mediation_factor
-        effective_s_min = center - new_range / 2.0
-        effective_s_max = center + new_range / 2.0
-
-    # Convert to S-coordinate space
-    S_x = norm_x * (effective_s_max - effective_s_min) + effective_s_min
-    S_y = (1 - norm_y) * (effective_s_max - effective_s_min) + effective_s_min  # Flip Y axis
-    
+    if np.isclose(1 - z_3d, 0): # Avoid division by zero if point is at North Pole
+        return np.array([0.0, 0.0]) # Or handle as infinity, but 0.0 is common for pole.
+    S_x = x_3d / (1 - z_3d)
+    S_y = y_3d / (1 - z_3d)
     return np.array([S_x, S_y])
 
-def calculate_adaptive_nuit_radius(s_coordinate_map, method='coverage_75'):
+def stereographic_inverse(S_2d):
     """
-    Calculate adaptive Nuit radius based on S-coordinate distribution.
-    
-    Args:
-        s_coordinate_map: Array of S-coordinates [height, width, 2]
-        method: Method for calculating radius
-                - 'coverage_XX': Include XX% of points within circle
-                - 'max_extent': Use maximum extent of coordinates
-                - 'aspect_aware': Consider image aspect ratio
-    
-    Returns:
-        nuit_radius: Calculated radius for Nuit boundary
+    Recovers 3D Cartesian coordinates from 2D stereographic projection.
+    x = 2*S_x / (S_x^2 + S_y^2 + 1)
+    y = 2*S_y / (S_x^2 + S_y^2 + 1)
+    z = (S_x^2 + S_y^2 - 1) / (S_x^2 + S_y^2 + 1)
     """
-    s_coords_flat = s_coordinate_map.reshape(-1, 2)
-    distances = np.linalg.norm(s_coords_flat, axis=1)
+    norm_sq = np.dot(S_2d, S_2d) # S_x^2 + S_y^2
+    denom = norm_sq + 1
+    x_3d = 2 * S_2d[0] / denom
+    y_3d = 2 * S_2d[1] / denom
+    z_3d = (norm_sq - 1) / denom
+    return np.array([x_3d, y_3d, z_3d])
+
+# --- S-Coordinate and Depth Calculation Functions ---
+
+def pixel_to_s_coordinate_mediated(px, py, width, height, s_bounds, lum, sat, lum_map_weight, sat_map_weight):
+    """
+    Maps pixel coordinates (px, py) to S-coordinates, with optional color mediation.
+    s_bounds can be a single float (symmetric) or a tuple (-min_val, max_val).
+    """
+    # Normalize pixel coordinates to -1 to 1 range, centered
+    norm_x = (px / (width - 1)) * 2 - 1
+    norm_y = (py / (height - 1)) * 2 - 1 # Y is typically inverted for image coordinates (0 at top)
+
+    # Determine base S-coordinate range
+    if isinstance(s_bounds, tuple):
+        s_min_x, s_max_x = s_bounds[0], s_bounds[1]
+        s_min_y, s_max_y = s_bounds[0], s_bounds[1] # Assuming symmetric for X and Y for s_bounds tuple
+    else: # single float means symmetric bounds, e.g., -2.0 to 2.0
+        s_min_x, s_max_x = -s_bounds, s_bounds
+        s_min_y, s_max_y = -s_bounds, s_bounds
+
+    # Apply color mediation to influence the S-coordinate mapping
+    # This dynamically adjusts the 'effective' s_bounds for each pixel
+    effective_s_max_x = s_max_x * (1 + lum * lum_map_weight + sat * sat_map_weight)
+    effective_s_min_x = s_min_x * (1 + lum * lum_map_weight + sat * sat_map_weight)
+    effective_s_max_y = s_max_y * (1 + lum * lum_map_weight + sat * sat_map_weight)
+    effective_s_min_y = s_min_y * (1 + lum * lum_map_weight + sat * sat_map_weight)
+
+    S_x = (norm_x + 1) / 2 * (effective_s_max_x - effective_s_min_x) + effective_s_min_x
+    S_y = (norm_y + 1) / 2 * (effective_s_max_y - effective_s_min_y) + effective_s_min_y
     
+    # Ensure S_x and S_y are clipped to reasonable, though expanded, bounds
+    # Clipping against a slightly larger fixed bound for extreme color shifts
+    clip_val = max(abs(s_max_x), abs(s_max_y)) * 5 # Allow some extreme expansion for mediation
+    S_x = np.clip(S_x, -clip_val, clip_val)
+    S_y = np.clip(S_y, -clip_val, clip_val)
+
+    return np.array([S_x, S_y])
+
+def calculate_adaptive_nuit_radius(s_coordinate_map, method='coverage_75', fixed_radius=None):
+    """
+    Calculates an adaptive Nuit radius based on the distribution of S-coordinates.
+    s_coordinate_map: A 2D array of S_x, S_y coordinates (e.g., from generate_s_depth_map)
+                      shape (N, 2) where N is number of pixels.
+    method: 'coverage_XX' (e.g., 'coverage_75' for 75th percentile of distances)
+            'max_extent' (uses a percentile of the max coordinate extent)
+            'aspect_aware' (considers distribution's aspect ratio)
+            'mean_distance' (mean + one std dev of distances from origin)
+    fixed_radius: If provided, this value is used directly, overriding adaptive methods.
+    """
+    if fixed_radius is not None:
+        return fixed_radius
+
+    if not s_coordinate_map.size:
+        return 1.0 # Default if no S-coords
+
+    distances = np.linalg.norm(s_coordinate_map, axis=1) # Radial distance from S-origin
+
     if method.startswith('coverage_'):
-        # Extract percentage from method name
-        coverage_percent = int(method.split('_')[1])
-        nuit_radius = np.percentile(distances, coverage_percent)
-        
+        try:
+            percentile = float(method.split('_')[1])
+            if not (0 <= percentile <= 100):
+                raise ValueError
+            return np.percentile(distances, percentile)
+        except (IndexError, ValueError):
+            print(f"Warning: Invalid coverage method '{method}'. Falling back to 75th percentile.")
+            return np.percentile(distances, 75)
+
     elif method == 'max_extent':
-        # Use 95% of maximum extent to avoid outliers
-        nuit_radius = np.percentile(distances, 95)
-        
+        max_abs_s_x = np.max(np.abs(s_coordinate_map[:, 0]))
+        max_abs_s_y = np.max(np.abs(s_coordinate_map[:, 1]))
+        # Use 95th percentile of the maximum dimension as a heuristic
+        return max(max_abs_s_x, max_abs_s_y) * 0.95
+
     elif method == 'aspect_aware':
-        # Consider the aspect ratio of the coordinate distribution
-        s_x_range = np.ptp(s_coords_flat[:, 0])  # Peak-to-peak (max - min)
-        s_y_range = np.ptp(s_coords_flat[:, 1])
-        # Use the smaller range to ensure circle fits within bounds
-        nuit_radius = min(s_x_range, s_y_range) / 2
-        
+        std_x = np.std(s_coordinate_map[:, 0])
+        std_y = np.std(s_coordinate_map[:, 1])
+        if std_x == 0 and std_y == 0: return 1.0 # Avoid division by zero
+        # Combine std devs, perhaps weighted by an overall scale
+        return np.sqrt(std_x**2 + std_y**2) * 1.5 # Heuristic factor
+
     elif method == 'mean_distance':
-        # Use mean distance plus one standard deviation
-        nuit_radius = np.mean(distances) + np.std(distances)
+        return np.mean(distances) + np.std(distances) # Mean plus one standard deviation
+
+    else:
+        print(f"Warning: Unknown Nuit radius method '{method}'. Falling back to coverage_75.")
+        return np.percentile(distances, 75)
+
+
+def calculate_s_depth_mediated(S_2d, depth_method, nuit_radius, nuit_align_s_point,
+                                 s_bounds, # This is the bounds from the main mapping
+                                 lum=0.5, sat=0.5, lum_depth_influence=0.0, sat_depth_influence=0.0,
+                                 depth_falloff_factor=5.0, stereographic_mode='closest_center',
+                                 blend_method_weights=None,
+                                 num_steps=10): # Added for stepped_xy_s_coords
+
+    S_x, S_y = S_2d[0], S_2d[1]
+    
+    # Helper to encapsulate single method depth calculation logic
+    # This avoids repetitive code when blending
+    def _calculate_single_method_depth(method_name, S_x, S_y, nuit_radius, nuit_align_s_point, s_bounds, depth_falloff_factor, stereographic_mode, num_steps):
+        s_depth_val = 0.5 # Default neutral value
+
+        if method_name == 'nuit_distance':
+            # Depth highest near the Nuit boundary circle
+            distance_from_origin = np.linalg.norm(np.array([S_x, S_y]))
+            distance_from_nuit = abs(distance_from_origin - nuit_radius)
+            s_depth_val = 1.0 / (1.0 + distance_from_nuit * depth_falloff_factor) # Inverse relation to distance from boundary
+
+        elif method_name == 'nuit_aligned_point':
+            # Depth highest at a specific S-coordinate point
+            if nuit_align_s_point is None:
+                align_point = np.array([0.0, 0.0])
+            else:
+                align_point = nuit_align_s_point
+            distance_from_align_point = np.linalg.norm(np.array([S_x, S_y]) - align_point)
+            s_depth_val = 1.0 / (1.0 + distance_from_align_point * depth_falloff_factor) # Inverse relation to distance from point
+
+        elif method_name == 'stereographic_z':
+            # Uses the Z component of the 3D sphere point after inverse projection
+            S_3d = stereographic_inverse(np.array([S_x, S_y]))
+            # Interpret Z differently based on mode
+            if stereographic_mode == 'closest_center': # Z=1 at center (pole), Z=-1 at edges
+                s_depth_val = (1.0 - S_3d[2]) / 2.0 # Maps Z from [-1,1] to depth [1,0], then inverted
+            elif stereographic_mode == 'furthest_center': # Z=1 at center, Z=-1 at edges
+                s_depth_val = (S_3d[2] + 1.0) / 2.0 # Maps Z from [-1,1] to depth [0,1]
+            elif stereographic_mode == 'neutral_center_recede':
+                s_depth_val = -0.25 * S_3d[2] + 0.25 # Custom mapping
+            else: # Default to furthest_center if mode not recognized
+                 s_depth_val = (S_3d[2] + 1.0) / 2.0
+
+        elif method_name == 'radial_distance':
+            # Depth based on simple radial distance from the S-origin
+            distance = np.linalg.norm(np.array([S_x, S_y]))
+            s_depth_val = 1.0 / (1.0 + distance * depth_falloff_factor) # Higher depth closer to center
+
+        elif method_name == 'golden_spiral':
+            # Generates depth based on a golden spiral pattern
+            phi_ratio = (1 + np.sqrt(5)) / 2
+            angle = np.arctan2(S_y, S_x)
+            radius = np.linalg.norm(np.array([S_x, S_y]))
+            # Create a wave along the spiral path
+            spiral_factor = np.sin(angle * phi_ratio + radius * phi_ratio * 2.0)
+            s_depth_val = 0.5 + 0.5 * spiral_factor # Maps sin output [-1,1] to [0,1]
+
+        elif method_name == 'intensity_weighted':
+            # Depth based on coordinate magnitude with tanh falloff, creating a center spike
+            coord_magnitude = np.linalg.norm(np.array([S_x, S_y]))
+            val = np.tanh(coord_magnitude * depth_falloff_factor)
+            s_depth_val = 1.0 - val # Invert to make center high depth
+
+        elif method_name == 's_x_as_depth':
+            # Uses S_x directly as depth. Normalize to 0-1 range.
+            s_val_max = s_bounds[1] if isinstance(s_bounds, tuple) else s_bounds
+            s_val_min = s_bounds[0] if isinstance(s_bounds, tuple) else -s_bounds
+            range_x = s_val_max - s_val_min
+            if range_x == 0: s_depth_val = 0.5
+            else: s_depth_val = (S_x - s_val_min) / range_x
+
+        elif method_name == 's_y_as_depth':
+            # Uses S_y directly as depth. Normalize to 0-1 range.
+            s_val_max = s_bounds[1] if isinstance(s_bounds, tuple) else s_bounds
+            s_val_min = s_bounds[0] if isinstance(s_bounds, tuple) else -s_bounds
+            range_y = s_val_max - s_val_min
+            if range_y == 0: s_depth_val = 0.5
+            else: s_depth_val = (S_y - s_val_min) / range_y
+
+        elif method_name == 'sum_xy_s_coords':
+            # Depth based on the linear sum of S_x and S_y, creating a diagonal gradient
+            s_val_max = s_bounds[1] if isinstance(s_bounds, tuple) else s_bounds
+            s_val_min = s_bounds[0] if isinstance(s_bounds, tuple) else -s_bounds
+            
+            min_possible_sum = s_val_min + s_val_min
+            max_possible_sum = s_val_max + s_val_max
+            raw_sum = S_x + S_y
+            range_of_sum = max_possible_sum - min_possible_sum
+            
+            if range_of_sum == 0:
+                s_depth_val = 0.5
+            else:
+                s_depth_val = (raw_sum - min_possible_sum) / range_of_sum
         
-    else:  # default
-        nuit_radius = np.percentile(distances, 75)
-    
-    # Ensure minimum radius
-    nuit_radius = max(nuit_radius, 0.1)
-    
-    return nuit_radius
+        elif method_name == 'stepped_xy_s_coords': # <-- NEW GRADIENTLESS METHOD
+            s_val_max = s_bounds[1] if isinstance(s_bounds, tuple) else s_bounds
+            s_val_min = s_bounds[0] if isinstance(s_bounds, tuple) else -s_bounds
+            
+            # Normalize S_x and S_y to 0-1 range within their bounds
+            range_x = s_val_max - s_val_min
+            range_y = s_val_max - s_val_min
+            
+            if range_x == 0 or range_y == 0:
+                s_depth_val = 0.5
+            else:
+                norm_S_x = (S_x - s_val_min) / range_x
+                norm_S_y = (S_y - s_val_min) / range_y
 
-def get_hsv_components(image_array):
-    """
-    Converts an RGB image array to HSV and returns normalized luminosity (Value) and saturation components.
-    """
-    hsv_image = cv2.cvtColor(image_array, cv2.COLOR_RGB2HSV)
-    
-    # Normalize components to [0, 1]
-    # Hue [0, 179] -> [0, 1] (not used for mediation here, but useful to return)
-    # Saturation [0, 255] -> [0, 1]
-    # Value (Luminosity) [0, 255] -> [0, 1]
-    
-    luminosity = hsv_image[:, :, 2].astype(np.float32) / 255.0 # Value channel from HSV
-    saturation = hsv_image[:, :, 1].astype(np.float32) / 255.0 # Saturation channel from HSV
-    hue = hsv_image[:, :, 0].astype(np.float32) / 179.0
-    
-    return luminosity, saturation, hue
+                # Quantize values into 'num_steps' discrete levels
+                # Use max(1, num_steps) to prevent issues if num_steps is 0 or less
+                steps_x = np.floor(norm_S_x * max(1, num_steps))
+                steps_y = np.floor(norm_S_y * max(1, num_steps))
 
-def generate_s_depth_map(image_path, depth_method='nuit_distance', 
-                        s_bounds=(-2.0, 2.0), smooth_sigma=1.0,
-                        intensity_weight=0.3, # This is the global intensity blend weight
-                        nuit_radius_method='coverage_75', fixed_nuit_radius=None,
-                        use_color_mediation=False, # New flag
-                        lum_map_weight=0.0, sat_map_weight=0.0,
-                        lum_depth_influence=0.0, sat_depth_influence=0.0):
-    """
-    Generate a depth map from an image using S-coordinate analysis.
-    
-    Args:
-        image_path: Path to input image
-        depth_method: Method for calculating depth from S-coordinates
-        s_bounds: Bounds of S-coordinate space
-        smooth_sigma: Gaussian smoothing parameter
-        intensity_weight: Weight for blending with original image intensity
-        nuit_radius_method: Method for calculating adaptive Nuit radius
-        fixed_nuit_radius: Fixed radius (overrides adaptive method if provided)
-        use_color_mediation: Whether to mediate S-values by luminosity/saturation
-        lum_map_weight: Weight for luminosity's influence on S-coordinate mapping
-        sat_map_weight: Weight for saturation's influence on S-coordinate mapping
-        lum_depth_influence: Weight for luminosity's influence on final depth value
-        sat_depth_influence: Weight for saturation's influence on final depth value
-    
-    Returns:
-        depth_map: Depth map as numpy array
-        s_coordinate_map: 2D array of S-coordinates
-        original_image: Original image array
-        nuit_radius: Calculated or provided Nuit radius
-    """
-    # Load and process image
+                # Combine quantized steps (e.g., sum them)
+                combined_steps = steps_x + steps_y
+                
+                # Normalize the combined steps to a 0-1 depth range
+                max_combined_steps = 2 * (max(1, num_steps) - 1)
+                
+                if max_combined_steps <= 0:
+                    s_depth_val = 0.5
+                else:
+                    s_depth_val = combined_steps / max_combined_steps
+                    
+        return s_depth_val # Return calculated depth for this single method
+
+
+    # --- Blending Logic ---
+    if blend_method_weights:
+        final_s_depth = 0.0
+        total_weight = 0.0
+        
+        for method, weight in blend_method_weights.items():
+            if weight > 0: # Only calculate if weight is positive
+                method_depth = _calculate_single_method_depth(method, S_x, S_y, nuit_radius, nuit_align_s_point, s_bounds, depth_falloff_factor, stereographic_mode, num_steps)
+                final_s_depth += method_depth * weight
+                total_weight += weight
+        
+        if total_weight > 0:
+            s_depth = final_s_depth / total_weight # Normalize by total weight
+        else:
+            s_depth = 0.5 # Fallback if no valid methods or weights given
+            
+    else: # If no blend_method_weights, use the single depth_method as before
+        s_depth = _calculate_single_method_depth(depth_method, S_x, S_y, nuit_radius, nuit_align_s_point, s_bounds, depth_falloff_factor, stereographic_mode, num_steps)
+
+
+    # --- Mediation based on Luminosity and Saturation ---
+    if lum_depth_influence > 0 or sat_depth_influence > 0:
+        # A more robust way to blend color mediation
+        if lum_depth_influence > 0:
+            s_depth = (1.0 - lum_depth_influence) * s_depth + lum_depth_influence * lum
+        if sat_depth_influence > 0:
+            s_depth = (1.0 - sat_depth_influence) * s_depth + sat_depth_influence * sat
+
+    # Ensure depth is in [0, 1] range after mediation
+    return np.clip(s_depth, 0.0, 1.0)
+
+
+# --- Main Generation and Visualization Functions ---
+
+def generate_s_depth_map(image_path, depth_method='nuit_distance',
+                         s_bounds=(-2.0, 2.0), smooth_sigma=1.0,
+                         intensity_weight=0.3,
+                         nuit_radius_method='coverage_75', fixed_nuit_radius=None,
+                         nuit_align_s_point=None,
+                         depth_falloff_factor=5.0,
+                         stereographic_mode='closest_center',
+                         use_color_mediation=False,
+                         lum_map_weight=0.0, sat_map_weight=0.0,
+                         lum_depth_influence=0.0, sat_depth_influence=0.0,
+                         blend_method_weights=None, # Added for blending
+                         num_steps=10): # Added for stepped_xy_s_coords
+
+    # Load image
     try:
-        image = Image.open(image_path)
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
-        image_array = np.array(image)
-        
+        original_image_pil = Image.open(image_path).convert("RGB")
+        original_image = np.array(original_image_pil)
+    except FileNotFoundError:
+        print(f"Error: Image not found at {image_path}")
+        return None, None, None, None
     except Exception as e:
         print(f"Error loading image: {e}")
         return None, None, None, None
 
-    height, width = image_array.shape[:2]
-    
-    # Get grayscale intensity for final blending
-    gray_image = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
-    normalized_intensity = gray_image.astype(np.float32) / 255.0
-    
-    # Get luminosity and saturation maps for mediation
-    luminosity_map = np.zeros((height, width), dtype=np.float32)
-    saturation_map = np.zeros((height, width), dtype=np.float32)
-    if use_color_mediation:
-        luminosity_map, saturation_map, _ = get_hsv_components(image_array)
-    
-    # Initialize arrays
+    height, width, _ = original_image.shape
     depth_map = np.zeros((height, width), dtype=np.float32)
-    s_coordinate_map = np.zeros((height, width, 2), dtype=np.float32)
-    
-    print(f"Processing image: {width}x{height} pixels")
-    print(f"Depth method: {depth_method}")
-    if use_color_mediation:
-        print(f"Color Mediation Enabled: Map Weights (Lum:{lum_map_weight:.2f}, Sat:{sat_map_weight:.2f}), Depth Influence (Lum:{lum_depth_influence:.2f}, Sat:{sat_depth_influence:.2f})")
-    print("Calculating S-coordinates...")
-    
-    # First pass: Calculate all S-coordinates (potentially mediated)
-    for py in range(height):
-        for px in range(width):
-            current_lum = luminosity_map[py, px] if use_color_mediation else 0.5 # Default if not used
-            current_sat = saturation_map[py, px] if use_color_mediation else 0.5 # Default if not used
+    s_coordinate_map = np.zeros((height * width, 2), dtype=np.float32)
 
-            S_2d = pixel_to_s_coordinate_mediated(
-                px, py, width, height, s_bounds, 
-                current_lum, current_sat, 
-                lum_map_weight, sat_map_weight
-            )
-            s_coordinate_map[py, px] = S_2d
-    
-    # Calculate adaptive Nuit radius (based on potentially mediated S-coords)
-    if fixed_nuit_radius is not None:
-        nuit_radius = fixed_nuit_radius
-        print(f"Using fixed Nuit radius: {nuit_radius:.3f}")
+    # Convert to grayscale for intensity blending
+    gray_image = cv2.cvtColor(original_image, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+
+    # Get HSV components for color mediation if enabled
+    lum_map = np.zeros((height, width), dtype=np.float32)
+    sat_map = np.zeros((height, width), dtype=np.float32)
+    if use_color_mediation:
+        hsv_image = cv2.cvtColor(original_image, cv2.COLOR_RGB2HSV).astype(np.float32) / 255.0
+        lum_map = hsv_image[:, :, 2] # V channel for luminosity
+        sat_map = hsv_image[:, :, 1] # S channel for saturation
+
+    # Calculate adaptive Nuit radius if needed (done once before pixel loop)
+    # First, generate a preliminary s_coord_map for calculation if using adaptive Nuit
+    if 'nuit_distance' in (blend_method_weights.keys() if blend_method_weights else [depth_method]):
+        temp_s_coords = np.zeros((height * width, 2), dtype=np.float32)
+        for py in range(height):
+            for px in range(width):
+                idx = py * width + px
+                current_lum = lum_map[py, px] if use_color_mediation else 0.5
+                current_sat = sat_map[py, px] if use_color_mediation else 0.5
+                temp_s_coords[idx] = pixel_to_s_coordinate_mediated(
+                    px, py, width, height, s_bounds,
+                    current_lum, current_sat, lum_map_weight, sat_map_weight
+                )
+        nuit_radius_used = calculate_adaptive_nuit_radius(temp_s_coords, nuit_radius_method, fixed_nuit_radius)
+        del temp_s_coords # Free memory
     else:
-        nuit_radius = calculate_adaptive_nuit_radius(s_coordinate_map, nuit_radius_method)
-        print(f"Calculated adaptive Nuit radius ({nuit_radius_method}): {nuit_radius:.3f}")
-    
-    print("Calculating depth values...")
-    
-    # Second pass: Calculate depth values using the determined radius and mediation
+        nuit_radius_used = fixed_nuit_radius if fixed_nuit_radius is not None else 1.0 # Default if not used
+
+    print(f"Nuit radius used: {nuit_radius_used:.4f}")
+
+    # Main pixel loop to generate depth map
     for py in range(height):
-        if py % (height // 10) == 0:  # Progress indicator
-            print(f"Progress: {py/height*100:.1f}%")
-            
         for px in range(width):
-            S_2d = s_coordinate_map[py, px]
-            current_lum = luminosity_map[py, px] if use_color_mediation else 0.5
-            current_sat = saturation_map[py, px] if use_color_mediation else 0.5
+            idx = py * width + px
+
+            current_lum = lum_map[py, px] if use_color_mediation else 0.5
+            current_sat = sat_map[py, px] if use_color_mediation else 0.5
             
-            # Calculate depth from S-coordinate, with optional mediation
-            s_depth = calculate_s_depth_mediated(
-                S_2d, depth_method, nuit_radius, 
-                current_lum, current_sat, 
-                lum_depth_influence, sat_depth_influence
+            # Map pixel to S-coordinate (potentially mediated by color)
+            S_2d = pixel_to_s_coordinate_mediated(
+                px, py, width, height, s_bounds,
+                current_lum, current_sat, lum_map_weight, sat_map_weight
             )
+            s_coordinate_map[idx] = S_2d
+
+            # Calculate depth from S-coordinate, with optional mediation and blending
+            s_depth = calculate_s_depth_mediated(
+                S_2d, depth_method, nuit_radius_used, nuit_align_s_point,
+                s_bounds, # s_bounds passed here
+                current_lum, current_sat,
+                lum_depth_influence, sat_depth_influence,
+                depth_falloff_factor,
+                stereographic_mode,
+                blend_method_weights, # Pass blend weights
+                num_steps # Pass num_steps
+            )
+
+            # Blend calculated S-depth with original image intensity
+            final_depth = (1.0 - intensity_weight) * s_depth + intensity_weight * (1.0 - gray_image[py, px])
             
-            # Blend with original image intensity (global weight)
-            intensity = normalized_intensity[py, px]
-            final_depth = (1 - intensity_weight) * s_depth + intensity_weight * intensity
-            
-            depth_map[py, px] = final_depth
-    
-    # Apply Gaussian smoothing
+            depth_map[py, px] = np.clip(final_depth, 0.0, 1.0) # Ensure 0-1 range
+
+    # Apply Gaussian smoothing if requested
     if smooth_sigma > 0:
         depth_map = gaussian_filter(depth_map, sigma=smooth_sigma)
-    
-    print("Depth map generation complete!")
-    return depth_map, s_coordinate_map, image_array, nuit_radius
+        depth_map = np.clip(depth_map, 0.0, 1.0) # Re-clip after smoothing
 
-def visualize_depth_map(depth_map, s_coordinate_map, original_image, nuit_radius,
-                       save_path=None, show_plots=True):
-    """Visualize the generated depth map and S-coordinate analysis."""
+    return depth_map, s_coordinate_map, original_image, nuit_radius_used
+
+
+def visualize_depth_map(depth_map, s_coordinate_map, original_image, nuit_radius_used, depth_method, s_bounds, output_path=None, nuit_align_s_point=None):
+    """
+    Visualizes the generated depth map and related components.
+    """
+    if depth_map is None:
+        print("No depth map to visualize.")
+        return
+
+    height, width = depth_map.shape
+
+    fig = plt.figure(figsize=(18, 12)) # Adjusted for more plots
     
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    # Plot 1: Original Image
+    ax1 = fig.add_subplot(2, 3, 1)
+    ax1.imshow(original_image)
+    ax1.set_title("Original Image")
+    ax1.axis('off')
+
+    # Plot 2: Generated Depth Map (Grayscale Colormap)
+    ax2 = fig.add_subplot(2, 3, 2)
+    ax2.imshow(depth_map, cmap='gray') # Grayscale is typical for depth maps
+    ax2.set_title("Generated Depth Map")
+    ax2.axis('off')
+
+    # Plot 3: 3D Surface Plot of Depth Map
+    ax3 = fig.add_subplot(2, 3, 3, projection='3d')
+    X = np.arange(0, width, 1)
+    Y = np.arange(0, height, 1)
+    X, Y = np.meshgrid(X, Y)
+    ax3.plot_surface(X, Y, depth_map, cmap=cm.viridis, rstride=1, cstride=1, antialiased=True)
+    ax3.set_title("3D Depth Surface")
+    ax3.set_zlabel("Depth")
+    ax3.set_xlabel("X")
+    ax3.set_ylabel("Y")
+    ax3.view_init(elev=50, azim=-120) # Adjust view for better perspective
+
+    # Plot 4: S-coordinate Map (X component as image)
+    ax4 = fig.add_subplot(2, 3, 4)
+    S_x_map = s_coordinate_map[:, 0].reshape(height, width)
+    ax4.imshow(S_x_map, cmap='RdBu', origin='lower') # RdBu for divergent, origin='lower' for correct S-coord display
+    ax4.set_title("S_x Coordinate Map")
+    ax4.axis('off')
+    # Add colorbar for S_x
+    cbar4 = fig.colorbar(ax4.imshow(S_x_map, cmap='RdBu', origin='lower'), ax=ax4, shrink=0.7)
+    cbar4.set_label('S_x Value')
+
+
+    # Plot 5: S-coordinate Map (Y component as image)
+    ax5 = fig.add_subplot(2, 3, 5)
+    S_y_map = s_coordinate_map[:, 1].reshape(height, width)
+    ax5.imshow(S_y_map, cmap='RdBu', origin='lower') # RdBu for divergent
+    ax5.set_title("S_y Coordinate Map")
+    ax5.axis('off')
+    # Add colorbar for S_y
+    cbar5 = fig.colorbar(ax5.imshow(S_y_map, cmap='RdBu', origin='lower'), ax=ax5, shrink=0.7)
+    cbar5.set_label('S_y Value')
+
+
+    # Plot 6: S-coordinate Scatter Plot with Nuit Circle/Align Point
+    ax6 = fig.add_subplot(2, 3, 6)
+    # Color points by their depth
+    scatter_colors = depth_map.flatten()
+    scatter = ax6.scatter(s_coordinate_map[:, 0], s_coordinate_map[:, 1], c=scatter_colors, cmap='gray', s=1, alpha=0.5)
+    ax6.set_title("S-coordinate Scatter Plot (Colored by Depth)")
+    ax6.set_xlabel("S_x")
+    ax6.set_ylabel("S_y")
+    ax6.axvline(0, color='grey', linestyle='--', linewidth=0.5)
+    ax6.axhline(0, color='grey', linestyle='--', linewidth=0.5)
     
-    # Original image
-    axes[0, 0].imshow(original_image)
-    axes[0, 0].set_title('Original Image')
-    axes[0, 0].axis('off')
-    
-    # Depth map
-    depth_plot = axes[0, 1].imshow(depth_map, cmap='plasma', vmin=0, vmax=1)
-    axes[0, 1].set_title('S-Coordinate Depth Map')
-    axes[0, 1].axis('off')
-    plt.colorbar(depth_plot, ax=axes[0, 1], fraction=0.046, pad=0.04)
-    
-    # 3D depth visualization
-    ax_3d = fig.add_subplot(2, 3, 3, projection='3d')
-    h, w = depth_map.shape
-    # Downsample for visualization performance
-    step = max(1, min(h, w) // 50) 
-    x_3d, y_3d = np.meshgrid(np.arange(0, w, step), np.arange(0, h, step))
-    surface = ax_3d.plot_surface(x_3d, y_3d, 
-                                depth_map[::step, ::step], cmap='plasma', alpha=0.8)
-    ax_3d.set_title('3D Depth Surface')
-    ax_3d.set_xlabel('X')
-    ax_3d.set_ylabel('Y')
-    ax_3d.set_zlabel('Depth')
-    
-    # S-coordinate X component
-    s_x_plot = axes[1, 0].imshow(s_coordinate_map[:, :, 0], cmap='RdBu')
-    axes[1, 0].set_title('S-Coordinate X Component')
-    axes[1, 0].axis('off')
-    plt.colorbar(s_x_plot, ax=axes[1, 0], fraction=0.046, pad=0.04)
-    
-    # S-coordinate Y component
-    s_y_plot = axes[1, 1].imshow(s_coordinate_map[:, :, 1], cmap='RdBu')
-    axes[1, 1].set_title('S-Coordinate Y Component')
-    axes[1, 1].axis('off')
-    plt.colorbar(s_y_plot, ax=axes[1, 1], fraction=0.046, pad=0.04)
-    
-    # Nuit boundary analysis with adaptive radius
-    axes[1, 2].set_aspect('equal')
-    
-    # Calculate bounds for visualization
-    s_coords_flat = s_coordinate_map.reshape(-1, 2)
-    coord_range = np.max(np.abs(s_coords_flat))
-    plot_range = max(coord_range * 1.1, nuit_radius * 1.2)
-    
-    axes[1, 2].set_xlim(-plot_range, plot_range)
-    axes[1, 2].set_ylim(-plot_range, plot_range)
-    
-    # Sample S-coordinates for visualization
-    sample_step = max(1, min(depth_map.shape) // 50)
-    sample_s_coords = s_coordinate_map[::sample_step, ::sample_step].reshape(-1, 2)
-    
-    # Color points by their depth values
-    sample_depths = depth_map[::sample_step, ::sample_step].flatten()
-    scatter = axes[1, 2].scatter(sample_s_coords[:, 0], sample_s_coords[:, 1], 
-                                c=sample_depths, cmap='plasma', s=1, alpha=0.6)
-    
-    # Add adaptive Nuit boundary circle
-    circle = plt.Circle((0, 0), nuit_radius, fill=False, color='white', linewidth=2)
-    axes[1, 2].add_patch(circle)
-    axes[1, 2].set_title(f'S-Coordinates with Nuit Boundary (r={nuit_radius:.2f})')
-    axes[1, 2].grid(True, alpha=0.3)
-    plt.colorbar(scatter, ax=axes[1, 2], fraction=0.046, pad=0.04)
-    
-    plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Visualization saved to: {save_path}")
-    
-    if show_plots:
-        plt.show()
-    
-    return fig
+    # Set limits based on S_bounds to show the full conceptual space
+    if isinstance(s_bounds, tuple):
+        ax6.set_xlim(s_bounds[0], s_bounds[1])
+        ax6.set_ylim(s_bounds[0], s_bounds[1])
+    else:
+        ax6.set_xlim(-s_bounds, s_bounds)
+        ax6.set_ylim(-s_bounds, s_bounds)
+
+    # Add Nuit circle or alignment point if relevant to the method
+    if 'nuit_distance' in depth_method or ('nuit_distance' in (args.blend_methods if args.blend_methods else '')):
+        circle = plt.Circle((0, 0), nuit_radius_used, color='red', fill=False, linestyle='--', linewidth=2, label=f'Nuit Circle (R={nuit_radius_used:.2f})')
+        ax6.add_artist(circle)
+        ax6.legend(loc='upper right')
+    elif 'nuit_aligned_point' in depth_method or ('nuit_aligned_point' in (args.blend_methods if args.blend_methods else '')):
+        if nuit_align_s_point is not None:
+            ax6.plot(nuit_align_s_point[0], nuit_align_s_point[1], 'ro', markersize=10, label=f'Align Point ({nuit_align_s_point[0]:.2f},{nuit_align_s_point[1]:.2f})')
+            ax6.legend(loc='upper right')
+
+    fig.tight_layout()
+
+    if output_path:
+        plt.savefig(output_path)
+        print(f"Visualization saved to: {output_path}")
+    # Show plot (if not saving)
+    plt.show()
 
 def save_depth_map(depth_map, output_path):
-    """Save depth map as 16-bit grayscale image."""
-    # Convert to 16-bit integer
-    depth_16bit = (depth_map * 65535).astype(np.uint16)
+    """
+    Saves the depth map as a 16-bit grayscale PNG.
+    """
+    if depth_map is None:
+        print("No depth map to save.")
+        return
+
+    # Normalize to 0-65535 for 16-bit PNG
+    depth_map_16bit = (depth_map * 65535).astype(np.uint16)
     
-    # Save as PNG
-    cv2.imwrite(output_path, depth_16bit)
-    print(f"Depth map saved to: {output_path}")
+    # Using Pillow to save 16-bit grayscale
+    img_pil = Image.fromarray(depth_map_16bit, mode='I;16') # I;16 is 16-bit grayscale
+    img_pil.save(output_path)
+    print(f"Depth map saved as 16-bit PNG: {output_path}")
+
+# --- Main Execution ---
 
 def main():
-    parser = argparse.ArgumentParser(description='Generate depth map using S-coordinates with adaptive Nuit radius and color mediation')
-    parser.add_argument('image_path', help='Path to input image')
-    parser.add_argument('--output_dir', default='./s_depth_output', 
-                       help='Output directory for results')
-    parser.add_argument('--depth_method', default='nuit_distance',
-                       choices=['nuit_distance', 'stereographic_z', 'radial_distance', 
-                               'golden_spiral', 'intensity_weighted'],
-                       help='Method for calculating depth from S-coordinates')
-    parser.add_argument('--s_bounds', type=float, default=2.0,
-                       help='S-coordinate space bounds (symmetric)')
-    parser.add_argument('--smooth_sigma', type=float, default=1.0,
-                       help='Gaussian smoothing sigma (0 for no smoothing)')
-    parser.add_argument('--intensity_weight', type=float, default=0.3,
-                       help='Weight for blending with original image intensity')
-    parser.add_argument('--nuit_radius_method', default='coverage_75',
-                       choices=['coverage_50', 'coverage_60', 'coverage_70', 'coverage_75', 
-                               'coverage_80', 'coverage_90', 'max_extent', 'aspect_aware', 'mean_distance'],
-                       help='Method for calculating adaptive Nuit radius')
-    parser.add_argument('--fixed_nuit_radius', type=float, default=None,
-                       help='Fixed Nuit radius (overrides adaptive calculation)')
-    parser.add_argument('--no_display', action='store_true',
-                       help='Skip displaying plots')
+    parser = argparse.ArgumentParser(description="Generate a depth map from an image using S-coordinate analysis.")
+    parser.add_argument('image_path', type=str, help='Path to the input image.')
+    parser.add_argument('--output_dir', type=str, default='output', help='Directory to save results.')
     
-    # New arguments for color mediation
+    # Core depth method parameters
+    parser.add_argument('--depth_method', type=str, default='intensity_weighted',
+                        choices=['nuit_distance', 'nuit_aligned_point', 'stereographic_z',
+                                 'radial_distance', 'golden_spiral', 'intensity_weighted',
+                                 's_x_as_depth', 's_y_as_depth', 'sum_xy_s_coords', 'stepped_xy_s_coords'], # <--- ADDED stepped_xy_s_coords
+                        help='Primary method for calculating depth from S-coordinates (used if no blend_weights).')
+    parser.add_argument('--s_bounds', type=float, default=2.0,
+                        help='Symmetric bounds for S-coordinate space mapping (e.g., 2.0 means -2.0 to 2.0 for both X and Y).')
+    parser.add_argument('--smooth_sigma', type=float, default=1.0,
+                        help='Standard deviation for Gaussian smoothing of the depth map (0 for no smoothing).')
+    parser.add_argument('--intensity_weight', type=float, default=0.3,
+                        help='Weight to blend original image intensity into the depth map (0 for pure S-depth, 1 for pure intensity).')
+
+    # Nuit-specific parameters
+    parser.add_argument('--nuit_radius_method', type=str, default='coverage_75',
+                        choices=['coverage_75', 'coverage_90', 'max_extent', 'aspect_aware', 'mean_distance'],
+                        help='Method to calculate Nuit radius for "nuit_distance" depth. (e.g., coverage_75, max_extent).')
+    parser.add_argument('--fixed_nuit_radius', type=float, default=None,
+                        help='Use a fixed Nuit radius instead of calculating adaptively. Overrides --nuit_radius_method.')
+    parser.add_argument('--nuit_align_s_x', type=float, default=0.0,
+                        help='S_x coordinate for "nuit_aligned_point" method.')
+    parser.add_argument('--nuit_align_s_y', type=float, default=0.0,
+                        help='S_y coordinate for "nuit_aligned_point" method.')
+
+    # Depth Falloff and Stereographic Mode
+    parser.add_argument('--depth_falloff_factor', type=float, default=5.0,
+                        help='Controls the steepness of depth falloff for methods like nuit_distance, radial_distance, intensity_weighted.')
+    parser.add_argument('--stereographic_mode', type=str, default='closest_center',
+                        choices=['closest_center', 'furthest_center', 'neutral_center_recede'],
+                        help='Interpretation of Z component for "stereographic_z" method.')
+
+    # Color Mediation Parameters
     parser.add_argument('--use_color_mediation', action='store_true',
-                       help='Enable mediation of S-values based on luminosity and saturation')
+                        help='Enable color (luminosity/saturation) to influence S-coordinate mapping and/or depth calculation.')
     parser.add_argument('--lum_map_weight', type=float, default=0.0,
-                       help='Weight for luminosity influence on S-coordinate mapping (0-1, 0 for no influence)')
+                        help='Influence of luminosity on S-coordinate mapping (0-1).')
     parser.add_argument('--sat_map_weight', type=float, default=0.0,
-                       help='Weight for saturation influence on S-coordinate mapping (0-1, 0 for no influence)')
+                        help='Influence of saturation on S-coordinate mapping (0-1).')
     parser.add_argument('--lum_depth_influence', type=float, default=0.0,
-                       help='Weight for luminosity influence on final depth value (0-1, 0 for no influence)')
+                        help='Influence of luminosity on final depth value (0-1).')
     parser.add_argument('--sat_depth_influence', type=float, default=0.0,
-                       help='Weight for saturation influence on final depth value (0-1, 0 for no influence)')
+                        help='Influence of saturation on final depth value (0-1).')
+
+    # Blending Parameters
+    parser.add_argument('--blend_methods', type=str, default='',
+                        help='Comma-separated list of method:weight pairs for blending (e.g., "nuit_distance:0.7,sum_xy_s_coords:0.3"). Overrides --depth_method if provided.')
+
+    # Stepped method parameters
+    parser.add_argument('--num_steps', type=int, default=10, # <--- ADDED num_steps ARG
+                        help='Number of discrete depth steps for "stepped_xy_s_coords" method. A smaller number means fewer, larger steps.')
+
+    # Output and Display
+    parser.add_argument('--no_display', action='store_true',
+                        help='Do not display matplotlib plots.')
 
     args = parser.parse_args()
-    
-    # Create output directory
+
+    # Create output directory if it doesn't exist
     os.makedirs(args.output_dir, exist_ok=True)
-    
+
+    # Prepare nuit_align_s_point if needed
+    nuit_align_s_point = np.array([args.nuit_align_s_x, args.nuit_align_s_y])
+
+    # Prepare blend_method_weights dictionary
+    blend_method_weights = None
+    if args.blend_methods:
+        blend_method_weights = {}
+        try:
+            for item in args.blend_methods.split(','):
+                method, weight_str = item.split(':')
+                method = method.strip()
+                if method not in parser.choices['depth_method']:
+                    print(f"Warning: Unknown method '{method}' in --blend_methods. Skipping.")
+                    continue
+                blend_method_weights[method] = float(weight_str.strip())
+            print(f"Blending methods: {blend_method_weights}")
+            if not blend_method_weights:
+                print("No valid blend methods specified. Falling back to primary depth_method.")
+                blend_method_weights = None
+        except ValueError:
+            print("Error parsing --blend_methods. Ensure format is 'method:weight,method2:weight2'. Using primary depth_method instead.")
+            blend_method_weights = None # Fallback to single method
+
     # Generate depth map
-    result = generate_s_depth_map(
+    depth_map, s_coordinate_map, original_image, nuit_radius_used = generate_s_depth_map(
         args.image_path,
         depth_method=args.depth_method,
-        s_bounds=(-args.s_bounds, args.s_bounds),
+        s_bounds=(-args.s_bounds, args.s_bounds), # Pass s_bounds as a tuple
         smooth_sigma=args.smooth_sigma,
         intensity_weight=args.intensity_weight,
         nuit_radius_method=args.nuit_radius_method,
         fixed_nuit_radius=args.fixed_nuit_radius,
+        nuit_align_s_point=nuit_align_s_point,
+        depth_falloff_factor=args.depth_falloff_factor,
+        stereographic_mode=args.stereographic_mode,
         use_color_mediation=args.use_color_mediation,
         lum_map_weight=args.lum_map_weight,
         sat_map_weight=args.sat_map_weight,
         lum_depth_influence=args.lum_depth_influence,
-        sat_depth_influence=args.sat_depth_influence
+        sat_depth_influence=args.sat_depth_influence,
+        blend_method_weights=blend_method_weights, # Pass blend weights
+        num_steps=args.num_steps # <--- PASS num_steps
     )
-    
-    if result[0] is None:
-        print("Failed to generate depth map")
-        return
-    
-    depth_map, s_coordinate_map, original_image, nuit_radius = result
-    
-    # Generate output filenames
+
+    if depth_map is None:
+        return # Exit if image loading failed
+
+    # Save results
     base_name = os.path.splitext(os.path.basename(args.image_path))[0]
-    depth_map_suffix = f"depth_{args.depth_method}"
-    if args.fixed_nuit_radius is not None:
-        depth_map_suffix += f"_fixedR{args.fixed_nuit_radius:.2f}"
+    depth_map_output_path = os.path.join(args.output_dir, f"{base_name}_depth.png")
+    visualization_output_path = os.path.join(args.output_dir, f"{base_name}_viz.png")
+
+    save_depth_map(depth_map, depth_map_output_path)
+
+    if not args.no_display:
+        print("\nDisplaying results...")
+        visualize_depth_map(
+            depth_map, s_coordinate_map, original_image, nuit_radius_used, 
+            args.depth_method, # Pass depth_method for visualization logic
+            args.s_bounds, # Pass s_bounds for scatter plot limits
+            visualization_output_path,
+            nuit_align_s_point=nuit_align_s_point
+        )
     else:
-        depth_map_suffix += f"_{args.nuit_radius_method}"
-    
-    if args.use_color_mediation:
-        depth_map_suffix += f"_medL{args.lum_depth_influence:.2f}S{args.sat_depth_influence:.2f}"
-        if args.lum_map_weight > 0 or args.sat_map_weight > 0:
-            depth_map_suffix += f"mapL{args.lum_map_weight:.2f}S{args.sat_map_weight:.2f}"
+        print(f"Visualization not displayed. Saved to: {visualization_output_path}")
+
+    # Additional stats
+    print("\n--- Depth Map Statistics ---")
+    print(f"Min depth: {depth_map.min():.4f}")
+    print(f"Max depth: {depth_map.max():.4f}")
+    print(f"Mean depth: {depth_map.mean():.4f}")
+
+    # S-coordinate distribution check (optional)
+    if s_coordinate_map.size > 0:
+        distances = np.linalg.norm(s_coordinate_map, axis=1)
+        # Check coverage for 75th percentile (a common measure)
+        nuit_radius_check = np.percentile(distances, 75)
+        within_circle = np.sum(distances <= nuit_radius_check)
+        print(f"S-coords within 75th percentile radius ({nuit_radius_check:.2f}): {within_circle/len(s_coordinate_map)*100:.2f}%")
+        print(f"S-coords min X: {s_coordinate_map[:,0].min():.2f}, max X: {s_coordinate_map[:,0].max():.2f}")
+        print(f"S-coords min Y: {s_coordinate_map[:,1].min():.2f}, max Y: {s_coordinate_map[:,1].max():.2f}")
 
 
-    depth_map_path = os.path.join(args.output_dir, f"{base_name}_{depth_map_suffix}.png")
-    visualization_path = os.path.join(args.output_dir, f"{base_name}_analysis_{depth_map_suffix}.png")
-    
-    # Save depth map
-    save_depth_map(depth_map, depth_map_path)
-    
-    # Create and save visualization
-    fig = visualize_depth_map(depth_map, s_coordinate_map, original_image, nuit_radius,
-                             save_path=visualization_path, 
-                             show_plots=not args.no_display)
-    
-    # Print statistics
-    print(f"\nDepth Map Statistics:")
-    print(f"Min depth: {np.min(depth_map):.4f}")
-    print(f"Max depth: {np.max(depth_map):.4f}")
-    print(f"Mean depth: {np.mean(depth_map):.4f}")
-    print(f"Std depth: {np.std(depth_map):.4f}")
-    
-    # Analyze Nuit boundary alignment with adaptive radius
-    s_coords_flat = s_coordinate_map.reshape(-1, 2)
-    distances_from_nuit = np.abs(np.linalg.norm(s_coords_flat, axis=1) - nuit_radius)
-    boundary_tolerance = nuit_radius * 0.1  # 10% of radius
-    on_boundary_count = np.sum(distances_from_nuit < boundary_tolerance)
-    
-    print(f"\nNuit Boundary Analysis:")
-    print(f"Adaptive Nuit radius: {nuit_radius:.3f}")
-    print(f"Points near Nuit boundary (within {boundary_tolerance:.3f}): {on_boundary_count}")
-    print(f"Percentage on boundary: {on_boundary_count/len(s_coords_flat)*100:.2f}%")
-    
-    # Additional coverage statistics
-    distances = np.linalg.norm(s_coords_flat, axis=1)
-    within_circle = np.sum(distances <= nuit_radius)
-    print(f"Points within Nuit circle: {within_circle}")
-    print(f"Coverage percentage: {within_circle/len(s_coords_flat)*100:.2f}%")
-    
     print(f"\nResults saved to: {args.output_dir}")
 
 if __name__ == "__main__":
