@@ -50,14 +50,75 @@ def stereographic_inverse(S_2d):
     
     return np.array([x, y, z])
 
-def calculate_s_depth(S_2d, depth_method='nuit_distance', nuit_radius=1.0):
+def compute_s_coordinate_proper(px, py, width, height, image_intensity=None,
+                              reflection_normal=None, projection_type='stereographic'):
+    """
+    Proper S-coordinate computation using the mathematical pipeline.
+    
+    This implements the actual S-coordinate transformation:
+    1. Map pixel to unit sphere via spherical coordinates
+    2. Apply optional Householder reflection 
+    3. Project to 2D S-coordinates via stereographic/other projection
+    
+    Args:
+        px, py: Pixel coordinates
+        width, height: Image dimensions  
+        image_intensity: Optional image intensity for coordinate modulation
+        reflection_normal: Normal vector for Householder reflection (optional)
+        projection_type: Type of 3D to 2D projection
+    
+    Returns:
+        S_2d: Final S-coordinate
+        intermediate_results: Dict with intermediate computation results
+    """
+    
+    # Step 1: Map pixel to spherical coordinates on unit sphere
+    # Use image intensity and position to determine spherical mapping
+    norm_x = px / (width - 1)
+    norm_y = py / (height - 1)
+    
+    # Create spherical coordinates with proper mapping
+    # Use intensity to modulate the mapping if available
+    if image_intensity is not None:
+        # Intensity affects the spherical mapping
+        theta = 2 * np.pi * norm_x * (0.5 + 0.5 * image_intensity)
+        phi = np.pi * norm_y * (0.5 + 0.5 * image_intensity)
+    else:
+        theta = 2 * np.pi * norm_x
+        phi = np.pi * norm_y
+    
+    # Step 2: Convert to 3D point on unit sphere
+    G_3d = spherical_to_cartesian(theta, phi)
+    
+    # Step 3: Apply Householder reflection if specified
+    if reflection_normal is not None:
+        G_3d_reflected = householder_reflection_3d(G_3d, reflection_normal)
+    else:
+        G_3d_reflected = G_3d
+    
+    # Step 4: Project 3D sphere point to 2D S-coordinates
+    S_2d = project_3d_to_2d(G_3d_reflected, projection_type)
+    
+    # Store intermediate computation results
+    intermediate_results = {
+        'theta': theta,
+        'phi': phi, 
+        'G_3d_original': G_3d,
+        'G_3d_reflected': G_3d_reflected,
+        'reflection_applied': reflection_normal is not None,
+        'intensity_used': image_intensity
+    }
+    
+    return S_2d, intermediate_results
+
+def calculate_s_depth(S_2d, depth_method='nuit_distance', intermediate_results=None):
     """
     Calculate depth value from S-coordinates using various methods.
     
     Args:
         S_2d: 2D S-coordinate array [S_x, S_y]
         depth_method: Method for calculating depth
-        nuit_radius: Radius of the Nuit boundary circle
+        intermediate_results: Optional intermediate computation results
     
     Returns:
         depth: Depth value (0-1 range)
@@ -65,9 +126,9 @@ def calculate_s_depth(S_2d, depth_method='nuit_distance', nuit_radius=1.0):
     S_x, S_y = S_2d
     
     if depth_method == 'nuit_distance':
-        # Depth based on distance from Nuit boundary
+        # Depth based on distance from Nuit boundary (radius = 1)
         distance_from_origin = np.linalg.norm(S_2d)
-        distance_from_nuit = abs(distance_from_origin - nuit_radius)
+        distance_from_nuit = abs(distance_from_origin - 1.0)
         # Closer to boundary = higher depth
         depth = 1.0 / (1.0 + distance_from_nuit * 5.0)
         
@@ -97,6 +158,24 @@ def calculate_s_depth(S_2d, depth_method='nuit_distance', nuit_radius=1.0):
         coord_magnitude = np.sqrt(S_x**2 + S_y**2)
         depth = np.tanh(coord_magnitude)
         
+    elif depth_method == 'spherical_phi':
+        # Use original spherical phi coordinate if available
+        if intermediate_results and 'phi' in intermediate_results:
+            phi = intermediate_results['phi']
+            depth = phi / np.pi  # Normalize to [0, 1]
+        else:
+            depth = 0.5 + 0.25 * (S_x + S_y)
+            
+    elif depth_method == 'reflection_magnitude':
+        # Depth based on magnitude of reflection transformation
+        if intermediate_results and intermediate_results.get('reflection_applied', False):
+            original = intermediate_results['G_3d_original']
+            reflected = intermediate_results['G_3d_reflected']
+            reflection_magnitude = np.linalg.norm(reflected - original)
+            depth = np.tanh(reflection_magnitude)
+        else:
+            depth = calculate_s_depth(S_2d, 'nuit_distance')
+            
     else:
         # Default: simple coordinate-based depth
         depth = 0.5 + 0.25 * (S_x + S_y)
@@ -105,7 +184,7 @@ def calculate_s_depth(S_2d, depth_method='nuit_distance', nuit_radius=1.0):
     return np.clip(depth, 0.0, 1.0)
 
 def pixel_to_s_coordinate(px, py, width, height, s_bounds=(-2.0, 2.0)):
-    """Convert pixel coordinates to S-coordinate space."""
+    """Convert pixel coordinates to S-coordinate space (legacy method for compatibility)."""
     if isinstance(s_bounds, tuple):
         s_min, s_max = s_bounds
     else:
@@ -121,73 +200,67 @@ def pixel_to_s_coordinate(px, py, width, height, s_bounds=(-2.0, 2.0)):
     
     return np.array([S_x, S_y])
 
-def calculate_adaptive_nuit_radius(s_coordinate_map, method='coverage_75'):
+def generate_reflection_normal(method='random', image_intensity=None, px=None, py=None):
     """
-    Calculate adaptive Nuit radius based on S-coordinate distribution.
+    Generate reflection normal vector for Householder reflection.
     
     Args:
-        s_coordinate_map: Array of S-coordinates [height, width, 2]
-        method: Method for calculating radius
-                - 'coverage_XX': Include XX% of points within circle
-                - 'max_extent': Use maximum extent of coordinates
-                - 'aspect_aware': Consider image aspect ratio
+        method: Method for generating normal ('random', 'image_based', 'fixed')
+        image_intensity: Normalized image intensity (for image_based method)
+        px, py: Pixel coordinates (for image_based method)
     
     Returns:
-        nuit_radius: Calculated radius for Nuit boundary
+        normal: 3D normal vector
     """
-    s_coords_flat = s_coordinate_map.reshape(-1, 2)
-    distances = np.linalg.norm(s_coords_flat, axis=1)
+    if method == 'random':
+        # Random unit vector
+        normal = np.random.randn(3)
+        normal = normal / np.linalg.norm(normal)
+        
+    elif method == 'image_based' and image_intensity is not None:
+        # Normal based on image intensity and position
+        normal = np.array([
+            image_intensity * np.cos(px * 0.01),
+            image_intensity * np.sin(py * 0.01),
+            1.0 - image_intensity
+        ])
+        normal = normal / np.linalg.norm(normal)
+        
+    elif method == 'fixed':
+        # Fixed normal vector
+        normal = np.array([0.5, 0.5, 0.707])  # Diagonal direction
+        normal = normal / np.linalg.norm(normal)
+        
+    else:
+        # Default to no reflection
+        return None
     
-    if method.startswith('coverage_'):
-        # Extract percentage from method name
-        coverage_percent = int(method.split('_')[1])
-        nuit_radius = np.percentile(distances, coverage_percent)
-        
-    elif method == 'max_extent':
-        # Use 95% of maximum extent to avoid outliers
-        nuit_radius = np.percentile(distances, 95)
-        
-    elif method == 'aspect_aware':
-        # Consider the aspect ratio of the coordinate distribution
-        s_x_range = np.ptp(s_coords_flat[:, 0])  # Peak-to-peak (max - min)
-        s_y_range = np.ptp(s_coords_flat[:, 1])
-        # Use the smaller range to ensure circle fits within bounds
-        nuit_radius = min(s_x_range, s_y_range) / 2
-        
-    elif method == 'mean_distance':
-        # Use mean distance plus one standard deviation
-        nuit_radius = np.mean(distances) + np.std(distances)
-        
-    else:  # default
-        nuit_radius = np.percentile(distances, 75)
-    
-    # Ensure minimum radius
-    nuit_radius = max(nuit_radius, 0.1)
-    
-    return nuit_radius
+    return normal
 
 def generate_s_depth_map(image_path, depth_method='nuit_distance', 
                         s_bounds=(-2.0, 2.0), smooth_sigma=1.0,
                         use_image_intensity=True, intensity_weight=0.3,
-                        nuit_radius_method='coverage_75', fixed_nuit_radius=None):
+                        use_full_pipeline=True, projection_type='stereographic',
+                        reflection_method='none'):
     """
     Generate a depth map from an image using S-coordinate analysis.
     
     Args:
         image_path: Path to input image
         depth_method: Method for calculating depth from S-coordinates
-        s_bounds: Bounds of S-coordinate space
+        s_bounds: Bounds of S-coordinate space (for legacy method)
         smooth_sigma: Gaussian smoothing parameter
         use_image_intensity: Whether to blend with original image intensity
         intensity_weight: Weight for image intensity blending
-        nuit_radius_method: Method for calculating adaptive Nuit radius
-        fixed_nuit_radius: Fixed radius (overrides adaptive method if provided)
+        use_full_pipeline: Whether to use the complete S-coordinate pipeline
+        projection_type: Type of 3D to 2D projection
+        reflection_method: Method for generating reflection normal
     
     Returns:
         depth_map: Depth map as numpy array
         s_coordinate_map: 2D array of S-coordinates
         original_image: Original image array
-        nuit_radius: Calculated or provided Nuit radius
+        analysis_data: Additional analysis data
     """
     # Load and process image
     try:
@@ -210,36 +283,61 @@ def generate_s_depth_map(image_path, depth_method='nuit_distance',
     depth_map = np.zeros((height, width), dtype=np.float32)
     s_coordinate_map = np.zeros((height, width, 2), dtype=np.float32)
     
+    # Analysis data storage
+    analysis_data = {
+        'spherical_coords': np.zeros((height, width, 2), dtype=np.float32),
+        'reflection_applied': np.zeros((height, width), dtype=bool),
+        'projection_type': projection_type,
+        'reflection_method': reflection_method
+    }
+    
     print(f"Processing image: {width}x{height} pixels")
     print(f"Depth method: {depth_method}")
-    print("Calculating S-coordinates...")
+    print(f"Using full pipeline: {use_full_pipeline}")
+    print(f"Projection type: {projection_type}")
+    print(f"Reflection method: {reflection_method}")
+    print("Calculating S-coordinates and depth values...")
     
-    # First pass: Calculate all S-coordinates
-    for py in range(height):
-        for px in range(width):
-            S_2d = pixel_to_s_coordinate(px, py, width, height, s_bounds)
-            s_coordinate_map[py, px] = S_2d
-    
-    # Calculate adaptive Nuit radius
-    if fixed_nuit_radius is not None:
-        nuit_radius = fixed_nuit_radius
-        print(f"Using fixed Nuit radius: {nuit_radius:.3f}")
-    else:
-        nuit_radius = calculate_adaptive_nuit_radius(s_coordinate_map, nuit_radius_method)
-        print(f"Calculated adaptive Nuit radius ({nuit_radius_method}): {nuit_radius:.3f}")
-    
-    print("Calculating depth values...")
-    
-    # Second pass: Calculate depth values using the determined radius
+    # Process each pixel
     for py in range(height):
         if py % (height // 10) == 0:  # Progress indicator
             print(f"Progress: {py/height*100:.1f}%")
             
         for px in range(width):
-            S_2d = s_coordinate_map[py, px]
+            if use_full_pipeline:
+                # Generate reflection normal if needed
+                reflection_normal = None
+                if reflection_method != 'none':
+                    reflection_normal = generate_reflection_normal(
+                        reflection_method, 
+                        normalized_intensity[py, px], 
+                        px, py
+                    )
+                
+                # Use proper S-coordinate calculation
+                S_2d, intermediate_results = compute_s_coordinate_proper(
+                    px, py, width, height, 
+                    normalized_intensity[py, px],
+                    reflection_normal, 
+                    projection_type
+                )
+                
+                # Store analysis data
+                analysis_data['spherical_coords'][py, px] = [
+                    intermediate_results['theta'], 
+                    intermediate_results['phi']
+                ]
+                analysis_data['reflection_applied'][py, px] = intermediate_results['reflection_applied']
+                
+            else:
+                # Use legacy method
+                S_2d = pixel_to_s_coordinate(px, py, width, height, s_bounds)
+                intermediate_results = None
+            
+            s_coordinate_map[py, px] = S_2d
             
             # Calculate depth from S-coordinate
-            s_depth = calculate_s_depth(S_2d, depth_method, nuit_radius)
+            s_depth = calculate_s_depth(S_2d, depth_method, intermediate_results)
             
             # Optionally blend with image intensity
             if use_image_intensity:
@@ -256,13 +354,13 @@ def generate_s_depth_map(image_path, depth_method='nuit_distance',
         depth_map = gaussian_filter(depth_map, sigma=smooth_sigma)
     
     print("Depth map generation complete!")
-    return depth_map, s_coordinate_map, image_array, nuit_radius
+    return depth_map, s_coordinate_map, image_array, analysis_data
 
-def visualize_depth_map(depth_map, s_coordinate_map, original_image, nuit_radius,
-                       save_path=None, show_plots=True):
+def visualize_depth_map(depth_map, s_coordinate_map, original_image, 
+                       analysis_data=None, save_path=None, show_plots=True):
     """Visualize the generated depth map and S-coordinate analysis."""
     
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    fig, axes = plt.subplots(3, 3, figsize=(20, 16))
     
     # Original image
     axes[0, 0].imshow(original_image)
@@ -276,7 +374,7 @@ def visualize_depth_map(depth_map, s_coordinate_map, original_image, nuit_radius
     plt.colorbar(depth_plot, ax=axes[0, 1], fraction=0.046, pad=0.04)
     
     # 3D depth visualization
-    ax_3d = fig.add_subplot(2, 3, 3, projection='3d')
+    ax_3d = fig.add_subplot(3, 3, 3, projection='3d')
     h, w = depth_map.shape
     x_3d, y_3d = np.meshgrid(np.arange(w), np.arange(h))
     surface = ax_3d.plot_surface(x_3d[::10, ::10], y_3d[::10, ::10], 
@@ -298,16 +396,10 @@ def visualize_depth_map(depth_map, s_coordinate_map, original_image, nuit_radius
     axes[1, 1].axis('off')
     plt.colorbar(s_y_plot, ax=axes[1, 1], fraction=0.046, pad=0.04)
     
-    # Nuit boundary analysis with adaptive radius
+    # Nuit boundary analysis
     axes[1, 2].set_aspect('equal')
-    
-    # Calculate bounds for visualization
-    s_coords_flat = s_coordinate_map.reshape(-1, 2)
-    coord_range = np.max(np.abs(s_coords_flat))
-    plot_range = max(coord_range * 1.1, nuit_radius * 1.2)
-    
-    axes[1, 2].set_xlim(-plot_range, plot_range)
-    axes[1, 2].set_ylim(-plot_range, plot_range)
+    axes[1, 2].set_xlim(-2.5, 2.5)
+    axes[1, 2].set_ylim(-2.5, 2.5)
     
     # Sample S-coordinates for visualization
     sample_step = max(1, min(depth_map.shape) // 50)
@@ -318,12 +410,39 @@ def visualize_depth_map(depth_map, s_coordinate_map, original_image, nuit_radius
     scatter = axes[1, 2].scatter(sample_s_coords[:, 0], sample_s_coords[:, 1], 
                                 c=sample_depths, cmap='plasma', s=1, alpha=0.6)
     
-    # Add adaptive Nuit boundary circle
-    circle = plt.Circle((0, 0), nuit_radius, fill=False, color='white', linewidth=2)
+    # Add Nuit boundary circle
+    circle = plt.Circle((0, 0), 1.0, fill=False, color='white', linewidth=2)
     axes[1, 2].add_patch(circle)
-    axes[1, 2].set_title(f'S-Coordinates with Nuit Boundary (r={nuit_radius:.2f})')
+    axes[1, 2].set_title('S-Coordinates with Nuit Boundary')
     axes[1, 2].grid(True, alpha=0.3)
     plt.colorbar(scatter, ax=axes[1, 2], fraction=0.046, pad=0.04)
+    
+    # Additional analysis plots if analysis_data is available
+    if analysis_data is not None:
+        # Spherical coordinates theta
+        theta_plot = axes[2, 0].imshow(analysis_data['spherical_coords'][:, :, 0], 
+                                      cmap='hsv')
+        axes[2, 0].set_title('Spherical Theta (Azimuthal)')
+        axes[2, 0].axis('off')
+        plt.colorbar(theta_plot, ax=axes[2, 0], fraction=0.046, pad=0.04)
+        
+        # Spherical coordinates phi
+        phi_plot = axes[2, 1].imshow(analysis_data['spherical_coords'][:, :, 1], 
+                                    cmap='viridis')
+        axes[2, 1].set_title('Spherical Phi (Polar)')
+        axes[2, 1].axis('off')
+        plt.colorbar(phi_plot, ax=axes[2, 1], fraction=0.046, pad=0.04)
+        
+        # Reflection applied map
+        reflection_plot = axes[2, 2].imshow(analysis_data['reflection_applied'], 
+                                           cmap='binary')
+        axes[2, 2].set_title('Householder Reflection Applied')
+        axes[2, 2].axis('off')
+    else:
+        # Hide unused subplots
+        axes[2, 0].axis('off')
+        axes[2, 1].axis('off')
+        axes[2, 2].axis('off')
     
     plt.tight_layout()
     
@@ -346,26 +465,29 @@ def save_depth_map(depth_map, output_path):
     print(f"Depth map saved to: {output_path}")
 
 def main():
-    parser = argparse.ArgumentParser(description='Generate depth map using S-coordinates with adaptive Nuit radius')
+    parser = argparse.ArgumentParser(description='Generate depth map using S-coordinates')
     parser.add_argument('image_path', help='Path to input image')
     parser.add_argument('--output_dir', default='./s_depth_output', 
                        help='Output directory for results')
     parser.add_argument('--depth_method', default='nuit_distance',
                        choices=['nuit_distance', 'stereographic_z', 'radial_distance', 
-                               'golden_spiral', 'intensity_weighted'],
+                               'golden_spiral', 'intensity_weighted', 'spherical_phi',
+                               'reflection_magnitude'],
                        help='Method for calculating depth from S-coordinates')
     parser.add_argument('--s_bounds', type=float, default=2.0,
-                       help='S-coordinate space bounds (symmetric)')
+                       help='S-coordinate space bounds (symmetric, for legacy method)')
     parser.add_argument('--smooth_sigma', type=float, default=1.0,
                        help='Gaussian smoothing sigma (0 for no smoothing)')
     parser.add_argument('--intensity_weight', type=float, default=0.3,
                        help='Weight for blending with image intensity')
-    parser.add_argument('--nuit_radius_method', default='coverage_75',
-                       choices=['coverage_50', 'coverage_60', 'coverage_70', 'coverage_75', 
-                               'coverage_80', 'coverage_90', 'max_extent', 'aspect_aware', 'mean_distance'],
-                       help='Method for calculating adaptive Nuit radius')
-    parser.add_argument('--fixed_nuit_radius', type=float, default=None,
-                       help='Fixed Nuit radius (overrides adaptive calculation)')
+    parser.add_argument('--use_legacy', action='store_true',
+                       help='Use legacy pixel-to-S-coordinate method instead of full pipeline')
+    parser.add_argument('--projection_type', default='stereographic',
+                       choices=['stereographic', 'orthographic', 'cylindrical'],
+                       help='3D to 2D projection method')
+    parser.add_argument('--reflection_method', default='none',
+                       choices=['none', 'random', 'image_based', 'fixed'],
+                       help='Method for Householder reflection')
     parser.add_argument('--no_display', action='store_true',
                        help='Skip displaying plots')
     
@@ -374,34 +496,39 @@ def main():
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
+    # Set pipeline mode (default to full pipeline unless legacy is requested)
+    use_full_pipeline = not args.use_legacy
+    
     # Generate depth map
-    result = generate_s_depth_map(
+    depth_map, s_coordinate_map, original_image, analysis_data = generate_s_depth_map(
         args.image_path,
         depth_method=args.depth_method,
         s_bounds=(-args.s_bounds, args.s_bounds),
         smooth_sigma=args.smooth_sigma,
         intensity_weight=args.intensity_weight,
-        nuit_radius_method=args.nuit_radius_method,
-        fixed_nuit_radius=args.fixed_nuit_radius
+        use_full_pipeline=use_full_pipeline,
+        projection_type=args.projection_type,
+        reflection_method=args.reflection_method
     )
     
-    if result[0] is None:
+    if depth_map is None:
         print("Failed to generate depth map")
         return
     
-    depth_map, s_coordinate_map, original_image, nuit_radius = result
-    
     # Generate output filenames
     base_name = os.path.splitext(os.path.basename(args.image_path))[0]
-    radius_suffix = f"r{nuit_radius:.2f}" if args.fixed_nuit_radius is None else f"fixed_r{args.fixed_nuit_radius:.2f}"
-    depth_map_path = os.path.join(args.output_dir, f"{base_name}_depth_{args.depth_method}_{radius_suffix}.png")
-    visualization_path = os.path.join(args.output_dir, f"{base_name}_analysis_{args.depth_method}_{radius_suffix}.png")
+    pipeline_suffix = "full" if use_full_pipeline else "legacy"
+    depth_map_path = os.path.join(args.output_dir, 
+                                 f"{base_name}_depth_{args.depth_method}_{pipeline_suffix}.png")
+    visualization_path = os.path.join(args.output_dir, 
+                                    f"{base_name}_analysis_{args.depth_method}_{pipeline_suffix}.png")
     
     # Save depth map
     save_depth_map(depth_map, depth_map_path)
     
     # Create and save visualization
-    fig = visualize_depth_map(depth_map, s_coordinate_map, original_image, nuit_radius,
+    fig = visualize_depth_map(depth_map, s_coordinate_map, original_image, 
+                             analysis_data,
                              save_path=visualization_path, 
                              show_plots=not args.no_display)
     
@@ -412,22 +539,23 @@ def main():
     print(f"Mean depth: {np.mean(depth_map):.4f}")
     print(f"Std depth: {np.std(depth_map):.4f}")
     
-    # Analyze Nuit boundary alignment with adaptive radius
+    # Analyze Nuit boundary alignment
     s_coords_flat = s_coordinate_map.reshape(-1, 2)
-    distances_from_nuit = np.abs(np.linalg.norm(s_coords_flat, axis=1) - nuit_radius)
-    boundary_tolerance = nuit_radius * 0.1  # 10% of radius
-    on_boundary_count = np.sum(distances_from_nuit < boundary_tolerance)
+    distances_from_nuit = np.abs(np.linalg.norm(s_coords_flat, axis=1) - 1.0)
+    on_boundary_count = np.sum(distances_from_nuit < 0.1)  # Within 0.1 units
     
     print(f"\nNuit Boundary Analysis:")
-    print(f"Adaptive Nuit radius: {nuit_radius:.3f}")
-    print(f"Points near Nuit boundary (within {boundary_tolerance:.3f}): {on_boundary_count}")
+    print(f"Points near Nuit boundary (within 0.1): {on_boundary_count}")
     print(f"Percentage on boundary: {on_boundary_count/len(s_coords_flat)*100:.2f}%")
     
-    # Additional coverage statistics
-    distances = np.linalg.norm(s_coords_flat, axis=1)
-    within_circle = np.sum(distances <= nuit_radius)
-    print(f"Points within Nuit circle: {within_circle}")
-    print(f"Coverage percentage: {within_circle/len(s_coords_flat)*100:.2f}%")
+    # Additional analysis for full pipeline
+    if analysis_data is not None:
+        reflection_count = np.sum(analysis_data['reflection_applied'])
+        print(f"\nPipeline Analysis:")
+        print(f"Pixels with Householder reflection applied: {reflection_count}")
+        print(f"Reflection percentage: {reflection_count/(analysis_data['reflection_applied'].size)*100:.2f}%")
+        print(f"Projection type used: {analysis_data['projection_type']}")
+        print(f"Reflection method: {analysis_data['reflection_method']}")
     
     print(f"\nResults saved to: {args.output_dir}")
 
